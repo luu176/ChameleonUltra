@@ -11,6 +11,7 @@ import sys
 import time
 import serial.tools.list_ports
 import threading
+import random
 import struct
 from multiprocessing import Pool, cpu_count
 from typing import Union
@@ -31,7 +32,6 @@ from chameleon_enum import MifareClassicWriteMode, MifareClassicPrngType, Mifare
 from chameleon_enum import MifareUltralightWriteMode
 from chameleon_enum import AnimationMode, ButtonPressFunction, ButtonType, MfcValueBlockOperator
 from chameleon_enum import HIDFormat
-from crypto1 import Crypto1
 
 # NXP IDs based on https://www.nxp.com/docs/en/application-note/AN10833.pdf
 type_id_SAK_dict = {0x00: "MIFARE Ultralight Classic/C/EV1/Nano | NTAG 2xx",
@@ -354,7 +354,7 @@ class MFUAuthArgsUnit(ReaderRequiredUnit):
         def key_parser(key: str) -> bytes:
             try:
                 key = bytes.fromhex(key)
-            except ValueError:
+            except:
                 raise ValueError("Key should be a hex string")
 
             if len(key) not in [4, 16]:
@@ -421,7 +421,7 @@ class LFHIDIdArgsUnit(DeviceRequiredUnit):
         return parser
 
     @staticmethod
-    def check_limits(format: int, fc: Union[int, None], cn: Union[int, None], il: Union[int, None], oem: Union[int, None]):
+    def check_limits(format: int, fc: int | None, cn: int | None, il: int | None, oem: int | None):
         limits = {
             HIDFormat.H10301: [0xFF, 0xFFFF, 0, 0],
             HIDFormat.IND26: [0xFFF, 0xFFF, 0, 0],
@@ -465,6 +465,19 @@ class LFHIDIdArgsUnit(DeviceRequiredUnit):
             raise ArgsParserError(f"{HIDFormat(format)}: Issue Level must between 0 to {limit[2]}")
         if oem is not None and oem > limit[3]:
             raise ArgsParserError(f"{HIDFormat(format)}: OEM must between 0 to {limit[3]}")
+
+        """
+        HIDFormat.: [0xFFF, 0x3FFFF, 0x7, 0],
+        HIDFormat.: [0x3FF, 0xFFFFFF, 0, 0x7],
+        HIDFormat.: [0xFFFF, 0xFFFFF, 0, 0],
+        HIDFormat.: [0xFFF, 0xFFFF, 0, 0],
+        HIDFormat.: [0, 0xFFFFFFFFFF, 0, 0],
+        HIDFormat.: [0xFFF, 0xFFFFF, 0, 0x7F],
+        HIDFormat.: [0x3FFF, 0x3FFFFFFF, 0, 0],
+        HIDFormat.: [0x003FFFFF, 0x007FFFFF, 0, 0],
+        HIDFormat.: [0xFFFFF, 0x3FFFFFFFF, 0, 0],
+        HIDFormat.: [0xFFFFFF, 0xFFFFFFFF, 0, 0],
+        """
 
     def before_exec(self, args: argparse.Namespace):
         if super().before_exec(args):
@@ -1230,7 +1243,10 @@ class HFMFHardNested(ReaderRequiredUnit):
         # 3. Save nonces to a temporary file
         nonce_file_path = None
         temp_nonce_file = None
+        temp_output_file = None  # For hardnested output
+        process = None  # Define process here for finally block
         output_str = ""  # To store the output read from the file
+        output_log_path = ""  # To store the path of the output log
 
         try:
             # --- Nonce File Handling ---
@@ -1248,15 +1264,59 @@ class HFMFHardNested(ReaderRequiredUnit):
             print(
                 f"   Nonces saved to {'temporary ' if delete_nonce_on_close else ''}file: {os.path.abspath(nonce_file_path)}")
 
+            # --- Output File Handling ---
+            # Create a temporary file to capture hardnested's output
+            # Keep it open while the subprocess runs, use delete=False for manual cleanup
+            temp_output_file = tempfile.NamedTemporaryFile(
+                suffix=".log", prefix="hardnested_output_", delete=False,
+                mode='w+', encoding='utf-8', errors='replace', dir='.'
+            )
+            output_log_path = temp_output_file.name  # Store path for potential error messages
+            print(f"   Redirecting hardnested output to temporary log file: {os.path.abspath(output_log_path)}")
+
             # 4. Prepare and run the external hardnested tool, redirecting output
+            tool_name = "hardnested"
+            if sys.platform == "win32":
+                tool_executable = f"{tool_name}.exe"
+            else:
+                tool_executable = f"./{tool_name}"
+
+            tool_path = os.path.join(default_cwd, tool_executable)
+            # Use list for Popen, ensure paths are correct
+            cmd_recover_list = [tool_path, os.path.abspath(nonce_file_path)]
+
+            print(f"   Executing: {' '.join(cmd_recover_list)}")
             print(f"{CC}--- Running Hardnested Tool (Output redirected) ---{C0}")
 
-            output_str = execute_tool('hardnested', [os.path.abspath(nonce_file_path)])
+            # Run the process, redirecting stdout and stderr to the output file
+            process = subprocess.Popen(
+                cmd_recover_list,
+                cwd=default_cwd,  # Run from the bin directory
+                stdout=temp_output_file,  # Redirect stdout to file
+                stderr=subprocess.STDOUT,  # Redirect stderr to the same file as stdout
+            )
 
-            print(f"{CC}--- Hardnested Tool Finished ---{C0}")
+            # Wait for the process to complete
+            ret_code = process.wait()  # This blocks until the tool finishes
+
+            print(f"{CC}--- Hardnested Tool Finished (Exit Code: {ret_code}) ---{C0}")
 
             # 5. Read the output from the temporary log file
+            temp_output_file.seek(0)  # Go back to the start of the file
+            output_str = temp_output_file.read()  # Read the entire content
+            temp_output_file.close()  # Close the file
+            temp_output_file = None  # Clear the variable
+
+            # Optional: Print the captured output if needed for debugging
+            # print(f"{CY}--- Captured Hardnested Output ---{C0}\n{output_str}\n{CY}--- End Captured Output ---{C0}")
+
             # 6. Process the result (using output_str read from the file)
+            if ret_code != 0:
+                print(f"{CR}   Error: Hardnested exited with code {ret_code}. Check log: {os.path.abspath(output_log_path)}{C0}")
+                if output_str:
+                    print(f"{CR}   Output captured:\n{output_str}{C0}")
+                return None
+
             key_list = []
             key_prefix = "Key found: "  # Define the specific prefix to look for
             for line in output_str.splitlines():
@@ -1325,6 +1385,34 @@ class HFMFHardNested(ReaderRequiredUnit):
                     except OSError as e:
                         print(f"{CR}   Error deleting temporary nonce file {nonce_file_path}: {e}{C0}")
 
+            # Ensure output file is closed and deleted if an error occurred before its closure
+            if temp_output_file:  # If it wasn't closed and cleared in the try block
+                try:
+                    temp_output_file.close()
+                except Exception:
+                    pass  # Ignore errors during cleanup close
+
+            # Delete the output log file unless an error occurred and we want to keep it
+            if output_log_path and os.path.exists(output_log_path):
+                # Keep log if hardnested failed (ret_code != 0) or if verification failed?
+                # For now, let's always delete it unless there was an exception *before* reading it.
+                # If ret_code != 0, the path was already printed.
+                try:
+                    os.remove(output_log_path)
+                except OSError as e:
+                    print(f"{CR}   Error deleting temporary output log file {output_log_path}: {e}{C0}")
+
+            # Ensure process is terminated if something went wrong
+            if process and process.poll() is None:
+                try:
+                    print(f"{CY}   Terminating hardnested process...{C0}")
+                    process.terminate()  # Try graceful termination
+                    process.wait(timeout=0.5)  # Wait briefly
+                    if process.poll() is None:
+                        process.kill()  # Force kill if still running
+                except Exception as kill_err:
+                    print(f"{CR}   Error terminating process: {kill_err}{C0}")
+
     def on_exec(self, args: argparse.Namespace):
         block_known = args.blk
         type_known = MfcKeyType.B if args.b else MfcKeyType.A
@@ -1361,14 +1449,20 @@ class HFMFStaticEncryptedNested(ReaderRequiredUnit):
             '--key', '-k', help='Backdoor key (as hex[12] format), currently known: A396EFA4E24F (default), A31667A8CEC1, 518B3354E760. See https://eprint.iacr.org/2024/1275', metavar='<hex>', type=str)
         parser.add_argument('--sectors', '-s', type=int, metavar="<dec>", help="Sector count")
         parser.add_argument('--starting-sector', type=int, metavar="<dec>", help="Start recovery from this sector")
+        parser.add_argument('--stopping-sector', type=int, metavar="<dec>", help="Stop recovery at this sector")
         parser.set_defaults(sectors=16)
         parser.set_defaults(starting_sector=0)
+        parser.set_defaults(stopping_sector=16)
         parser.set_defaults(key='A396EFA4E24F')
         return parser
 
     def on_exec(self, args: argparse.Namespace):
+        found_key_map = self.senested(args.key, args.starting_sector, args.stopping_sector, args.sectors)
+        print_key_table(found_key_map)
+
+    def senested(self, key, starting_sector, stopping_sector, sectors):
         acquire_datas = self.cmd.mf1_static_encrypted_nested_acquire(
-            bytes.fromhex(args.key), args.sectors, args.starting_sector)
+            bytes.fromhex(key), sectors, starting_sector)
 
         if not acquire_datas:
             print('Failed to collect nonces, is card present and has backdoor?')
@@ -1379,7 +1473,7 @@ class HFMFStaticEncryptedNested(ReaderRequiredUnit):
 
         check_speed = 1.95  # sec per 64 keys
 
-        for sector in range(args.starting_sector, args.sectors):
+        for sector in range(starting_sector, stopping_sector):
             sector_name = str(sector).zfill(2)
             print('Recovering', sector, 'sector...')
             execute_tool('staticnested_1nt', [uid, sector_name, format(acquire_datas['nts']['a'][sector]['nt'], 'x').zfill(8), format(
@@ -1441,8 +1535,340 @@ class HFMFStaticEncryptedNested(ReaderRequiredUnit):
         for file in glob.glob(tempfile.gettempdir() + '/keys_*.dic'):
             os.remove(file)
 
-        print_key_table(key_map)
+        return key_map
 
+
+@hf_mf.command('autopwn')
+class HFMFAutopwn(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = 'Mifare Classic auto recovery tool'
+        parser.add_argument('-k', '--key', type=str, required=False, metavar="<hex>", help="Known key")
+        return parser
+    
+    def get_mf_size(self, sak):
+        size = "1k"
+        sectors = 16
+        if sak == b'\x18':
+            size = "4k"
+            sectors = 40
+        elif sak == b'\x08':
+            size = "1k"
+            sectors = 16
+        elif sak == b'\x09':
+            size = "mini"
+            sectors = 5
+        elif sak == b'\x10':
+            size = "2k"
+            sectors = 32
+        elif sak == b'\x01':
+            size = "1k"
+            sectors = 16
+        else:
+            print("I don't know how many sectors there are on this type of card, defaulting to 16")
+        return size, sectors
+
+    def getsak(self, deep=False):
+        return self.scan(deep, "sak")
+    
+    def getuid(self, deep=False):
+        return self.scan(deep, "uid")
+
+    def from_nt_level_code_to_str(self, nt_level):
+        if nt_level == 0:
+            return 'StaticNested'
+        if nt_level == 1:
+            return 'Nested'
+        if nt_level == 2:
+            return 'HardNested'
+    
+    def scan(self, deep=False, scanitem="uid"):
+        resp = self.cmd.hf14a_scan()
+        if resp is not None:
+            for data_tag in resp:
+                if deep:
+                    self.sak_info(data_tag)
+                    # TODO: following checks cannot be done yet if multiple cards are present
+                    if len(resp) == 1:
+                        self.check_mf1_nt()
+                        # TODO: check for ATS support on 14A3 tags
+                    else:
+                        print("Multiple tags detected, skipping deep tests...")
+                return data_tag[scanitem].hex().upper()
+        else:
+            print("ISO14443-A Tag no found")
+
+    def bits_to_10byte_mask(self, bits=0):
+        if not isinstance(bits, int):
+            raise TypeError("bits must be an integer")
+        if bits < 0 or bits > 80:
+            raise ValueError("bits must be between 0 and 80 (inclusive)")
+
+        ones = 80 - bits
+        if ones == 0:
+            value = 0
+        else:
+            value = (1 << ones) - 1  # lower `ones` bits set to 1
+
+        return bytes.fromhex(f"{value:020X}")  # 20 hex chars (10 bytes), uppercase
+
+    def try_key(self, key: bytes, mask: bytes):
+        resp = self.cmd.mf1_check_keys_of_sectors(mask, [key])
+        return resp
+
+    
+    def parse_found_keys(self, resp):
+        if 'sectorKeys' not in resp or not resp['sectorKeys']:
+            return None
+
+        result = {}
+        for sector, key_bytes in resp['sectorKeys'].items():
+            blocks_per_sector = 4  # default assumption for 1k cards
+            first_block = sector * blocks_per_sector
+            for i in range(blocks_per_sector):
+                block_num = first_block + i
+                result[block_num] = key_bytes.hex().upper()
+        return result
+
+    def bitwise_negate_bytes(self, data: bytes):
+        return bytes([~b & 0xFF for b in data]) 
+    
+    def merge_found_sector_keys(self, existing, response, overwrite = False):
+        sector_keys = response.get('sectorKeys', {})
+        for idx, key in sector_keys.items():
+            if overwrite or idx not in existing:
+                existing[idx] = key
+        return existing
+
+    def print_key_table(self, keymap, max_sectors):
+        top_line =    "╔══════╦══════════════╦══════════════╗"
+        bottom_line = "╚══════╩══════════════╩══════════════╝"
+        sep =         "╠══════╬══════════════╬══════════════╣"
+        print(top_line)
+        print("║ Sec  ║ key A        ║ key B        ║")
+
+        for sector in range(max_sectors):
+            print(sep)
+            key_a_idx = sector * 2
+            key_b_idx = key_a_idx + 1
+
+            a = keymap.get(key_a_idx)
+            b = keymap.get(key_b_idx)
+
+            # raw text for columns (no color wrappers yet)
+            if isinstance(a, (bytes, bytearray)):
+                a_text = a.hex().upper()            
+            else:
+                a_text = "------------"               
+
+            if isinstance(b, (bytes, bytearray)):
+                b_text = b.hex().upper()
+            else:
+                b_text = "------------"
+
+            a_padded = a_text.ljust(12)
+            b_padded = b_text.ljust(12)
+
+            # wrap with color codes
+            a_display = f"{CG}{a_padded}{C0}" if isinstance(a, (bytes, bytearray)) else f"{CR}{a_padded}{C0}"
+            b_display = f"{CG}{b_padded}{C0}" if isinstance(b, (bytes, bytearray)) else f"{CR}{b_padded}{C0}"
+
+            # print row with '|' separators and then print separator line
+            print(f"║ {sector:03d}  ║ {a_display} ║ {b_display} ║")
+        print(bottom_line)
+    
+    def find_missing_keys(self, existing_keys: dict, max_num: int):
+        # find missing keys
+        missing = [i for i in range(max_num) if i not in existing_keys]
+        # assign 96 for even, 97 for odd
+        generated = {i: (96 if i % 2 == 0 else 97) for i in missing}
+        return generated
+
+    def iterate_keys(self, generated_keys: dict):
+        for key_num, key_type in generated_keys.items():
+            yield key_num, key_type
+
+    def choose_random_known_key(self, keys_dict):
+        index = random.choice(list(keys_dict.keys()))
+        key_val = keys_dict[index]
+        odd_even_val = 97 if index % 2 else 96
+        return index * 4, key_val, odd_even_val
+
+    def mask_from_keys(self, pos_container, total_bits=80, one_indexed=False, msb_left=True):
+        if isinstance(pos_container, dict):
+            positions = pos_container.keys()
+        else:
+            positions = pos_container
+
+        field = ['0'] * total_bits
+        for p in positions:
+            # skip non-int keys gracefully
+            try:
+                p = int(p)
+            except Exception:
+                continue
+            idx = p - 1 if one_indexed else p
+            if idx < 0 or idx >= total_bits:
+                continue
+            if msb_left:
+                field[idx] = '1'
+            else:
+                field[total_bits - 1 - idx] = '1'
+
+        bstr = ''.join(field)
+        # Pack into bytes (8-bit groups from the left). If total_bits is multiple of 8 this is safe.
+        bytelist = [int(bstr[i:i+8], 2) for i in range(0, total_bits, 8)]
+        b = bytes(bytelist)
+        return bstr, b
+
+    def run_senested(self, current_keys_found, max_sectors_num):
+        neg = lambda b: (~int.from_bytes(b, 'big') & ((1 << (len(b)*8)) - 1)).to_bytes(len(b), 'big')
+        print(f" {CY}[+]{C0}  This card could be cracked using static nested attack (May take a few minutes)")
+        input_senested = input(f" {C0}[+]{C0}  Would you like to proceed? [y/n]: ") 
+        if input_senested.lower() == "y":
+            input_backdoor_key = input(f" {C0}[+]{C0}  Would you like to use default backdoor key? [y/n]: ")
+            backdoor_key = "A396EFA4E24F"
+            if input_backdoor_key.lower() == "n":
+                while True:
+                    backdoor_key = input(f" {C0}[+]{C0}  Which backdoor key would you like to use? (you can choose from: A396EFA4E24F (default) A31667A8CEC1, 518B3354E760) or custom key: ")
+                    if re.fullmatch(r"[A-F0-9]{12}", backdoor_key):
+                        print(f" {CG}[+]{C0}  Valid key")
+                        return False
+                    else:
+                        print(f" {CR}[!]{C0}  Invalid format for key")
+            else:
+                print(f" {CY}[+]{C0}  Using default key A396EFA4E24F")
+                print(f" {CG}[+]{C0}  Running static nested..")
+                snested = HFMFStaticEncryptedNested.__new__(HFMFStaticEncryptedNested) 
+                snested._device_cmd = self.cmd  
+                missing_keys = self.find_missing_keys(current_keys_found, max_sectors_num*2)
+                keys = list(self.iterate_keys(missing_keys))
+                for i, (key_num, key_type) in enumerate(keys):
+                    if current_keys_found.get(key_num) is None:  
+                        if i + 1 < len(keys):
+                            sector_num = key_num//2
+                            found_keymap = snested.senested(backdoor_key, sector_num, sector_num+1, max_sectors_num)
+
+                            next_key_num = keys[i + 1][0]
+                            if (next_key_num == key_num + 1) and (key_type == 96): # Next key is the same sector, and is going to be key b
+                                current_keys_found[key_num] = bytes.fromhex(found_keymap['A'][sector_num])
+                                current_keys_found[key_num+1] = bytes.fromhex(found_keymap['B'][sector_num])
+                            elif key_type == 96:
+                                current_keys_found[key_num] = bytes.fromhex(found_keymap['A'][sector_num])
+                            elif key_type == 97:
+                                current_keys_found[key_num] = bytes.fromhex(found_keymap['B'][sector_num])
+                            current_keys_found = dict(sorted(current_keys_found.items()))
+                            mask = self.mask_from_keys(missing_keys, total_bits=80, one_indexed=False, msb_left=True)
+                            neg_mask = neg(mask[1])
+                            resp = self.try_key(bytes.fromhex(found_keymap['A'][sector_num]), neg_mask)
+                            current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)   
+                            resp = self.try_key(bytes.fromhex(found_keymap['B'][sector_num]), neg_mask)
+                            current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)    
+                    else:
+                        print(f" {CG}[+]{C0}  Key {key_num} found by reuse")
+        return current_keys_found
+
+    def autopwn(self, key_known) -> Union[str, None]:
+        neg = lambda b: (~int.from_bytes(b, 'big') & ((1 << (len(b)*8)) - 1)).to_bytes(len(b), 'big')
+
+        keys = {
+            "FFFFFFFFFFFF": b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', # default key, tries it on all sectors.
+            # todo: add default keys from different systems and more
+        }
+        uid = self.getuid()
+        sak = self.getsak()
+        mf_size, max_sectors_num = self.get_mf_size(bytes.fromhex(sak))
+        print(f" {CG}[+]{C0}  Type: MIFARE Classic {CY}{mf_size}{C0}")
+        print(f" {CG}[+]{C0}  UID:", uid)
+        print(f" {CG}[+]{C0}  SAK:", sak)
+        nt_level = self.cmd.mf1_detect_prng()
+        print(f" {CG}[+]{C0}  NT vulnerable: {CY}{self.from_nt_level_code_to_str(nt_level)}{C0}")
+        requires_hardnested = False
+        requires_nested = False
+        requires_senested = False
+        current_keys_found = {}
+        all_keys_found = False
+        mask = self.bits_to_10byte_mask(max_sectors_num*2)
+        if key_known is not None:
+            resp = self.try_key(bytes.fromhex(key_known), mask)
+            current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)
+        for key, key_mask in keys.items():
+            resp = self.try_key(bytes.fromhex(key), key_mask) # trying default key
+            current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)
+        
+        if len(current_keys_found) == 0:
+            print(f" {CR}[!]{C0}  NO KEYS FOUND YET..")
+            print(f" {CG}[+]{C0}  Using darkside..")
+            darkside = HFMFDarkside.__new__(HFMFDarkside)
+            HFMFDarkside.__init__(darkside) 
+            darkside._device_cmd = self.cmd
+
+            # recover key A sector 0
+            darkside_key = darkside.recover_key(0x03, MfcKeyType.A)
+            if darkside_key is not None:
+                print(f" {CG}[+]{C0}  Found key using darkside: {darkside_key}")
+                current_keys_found[0] = bytes.fromhex(darkside_key)
+                current_keys_found = dict(sorted(current_keys_found.items()))
+                print(f" {CG}[+]{C0}  Reuse key check..")
+                mask = self.bits_to_10byte_mask(max_sectors_num*2)
+                resp = self.try_key(bytes.fromhex(darkside_key), mask)
+                current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)
+            else:
+                print(f" {CR}[!]{C0}  Failed to recover key using darkside!")
+                
+
+        if len(current_keys_found) == max_sectors_num*2:
+            print(f" {CG}[+]{C0}  ALL KEYS FOUND")
+            all_keys_found = True
+        elif len(current_keys_found) > 0:
+            print(f" {CG}[+]{C0}  SOME KEYS FOUND..")
+            if nt_level == 0:
+                requires_senested = True
+            elif nt_level == 2:
+                requires_hardnested = True
+                print(f" {CY}[+]{C0}  hardened card detected, please use 'hf mf hardnested' to recover keys")
+            else:
+                print(f" {CG}[+]{C0}  Using nested..")
+                block_known, key_known_bytes, type_known = self.choose_random_known_key(current_keys_found)
+                missing_keys = self.find_missing_keys(current_keys_found, max_sectors_num*2)
+                nested = HFMFNested.__new__(HFMFNested) 
+                nested._device_cmd = self.cmd  
+                for missing_key_num, key_type_target in self.iterate_keys(missing_keys):
+                    if current_keys_found.get(missing_key_num) is None:     
+                        nested_key = nested.recover_a_key(block_known, type_known, key_known_bytes, missing_key_num*4, key_type_target)
+                        if nested_key is not None:
+                            print(f" {CG}[+]{C0}  FOUND key {missing_key_num}: {nested_key.upper()}")
+                            print(f" {CG}[+]{C0}  Reuse key check..")
+                            current_keys_found[missing_key_num] = bytes.fromhex(nested_key)
+                            current_keys_found = dict(sorted(current_keys_found.items()))
+                            mask = self.mask_from_keys(missing_keys, total_bits=80, one_indexed=False, msb_left=True)
+                            neg_mask = neg(mask[1])
+                            resp = self.try_key(bytes.fromhex(nested_key), neg_mask)
+                            current_keys_found = self.merge_found_sector_keys(current_keys_found, resp)
+                    else:
+                        print(f" {CG}[+]{C0}  Key {missing_key_num} found by reuse")
+            if len(current_keys_found) == max_sectors_num*2:
+                print(f" {CG}[+]{C0}  ALL KEYS FOUND")
+                all_keys_found = True
+            else:
+                # use static nested
+                current_keys_found = self.run_senested(current_keys_found, max_sectors_num)
+        else:
+            # use static nested
+            current_keys_found = self.run_senested(current_keys_found, max_sectors_num)
+
+        
+        return current_keys_found, max_sectors_num
+
+    def on_exec(self, args: argparse.Namespace):
+        key_known: str = args.key
+        if key_known is not None:
+            if not re.match(r"^[a-fA-F0-9]{12}$", key_known):
+                print("key must include 12 HEX symbols")
+                return
+
+        extracted_keys, max_sectors_num = self.autopwn(key_known)
+        self.print_key_table(extracted_keys, max_sectors_num)   
 
 @hf_mf.command('fchk')
 class HFMFFCHK(ReaderRequiredUnit):
@@ -1823,34 +2249,32 @@ def _run_mfkey32v2(items):
 
 
 class ItemGenerator:
-    def __init__(self, rs, uid_found_keys = set()):
-        self.rs: list = rs
-        self.progress = 0
+    def __init__(self, rs, i=0, j=1):
+        self.rs = rs
         self.i = 0
         self.j = 1
         self.found = set()
         self.keys = set()
-        for known_key in uid_found_keys:
-            self.test_key(known_key)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        size = len(self.rs)
-        if self.j >= size:
-            self.i += 1
-            if self.i >= size - 1:
-                raise StopIteration
-            self.j = self.i + 1
-        item_i, item_j = self.rs[self.i], self.rs[self.j]
-        self.progress += 1
-        self.j += 1
+        try:
+            item_i = self.rs[self.i]
+        except IndexError:
+            raise StopIteration
         if self.key_from_item(item_i) in self.found:
-            self.progress += max(0, size - self.j)
             self.i += 1
             self.j = self.i + 1
             return next(self)
+        try:
+            item_j = self.rs[self.j]
+        except IndexError:
+            self.i += 1
+            self.j = self.i + 1
+            return next(self)
+        self.j += 1
         if self.key_from_item(item_j) in self.found:
             return next(self)
         return item_i, item_j
@@ -1859,20 +2283,17 @@ class ItemGenerator:
     def key_from_item(item):
         return "{uid}-{nt}-{nr}-{ar}".format(**item)
 
-    def test_key(self, key, items = list()):
-        for item in self.rs:
-            item_key = self.key_from_item(item)
-            if item_key in self.found:
-                continue
-            if (item in items) or (Crypto1.mfkey32_is_reader_has_key(
-                int(item['uid'], 16),
-                int(item['nt'], 16),
-                int(item['nr'], 16),
-                int(item['ar'], 16),
-                key,
-            )):
-                self.keys.add(key)
-                self.found.add(item_key)
+    def key_found(self, key, items):
+        self.keys.add(key)
+        for item in items:
+            try:
+                if item == self.rs[self.i]:
+                    self.i += 1
+                    self.j = self.i + 1
+            except IndexError:
+                break
+        self.found.update(self.key_from_item(item) for item in items)
+
 
 @hf_mf.command('elog')
 class HFMFELog(DeviceRequiredUnit):
@@ -1884,7 +2305,7 @@ class HFMFELog(DeviceRequiredUnit):
         parser.add_argument('--decrypt', action='store_true', help="Decrypt key from MF1 log list")
         return parser
 
-    def decrypt_by_list(self, rs: list, uid_found_keys: set = set()):
+    def decrypt_by_list(self, rs: list):
         """
             Decrypt key from reconnaissance log list
 
@@ -1894,14 +2315,16 @@ class HFMFELog(DeviceRequiredUnit):
         msg1 = f"  > {len(rs)} records => "
         msg2 = f"/{(len(rs)*(len(rs)-1))//2} combinations. "
         msg3 = " key(s) found"
-        gen = ItemGenerator(rs, uid_found_keys)
-        print(f"{msg1}{gen.progress}{msg2}{len(gen.keys)}{msg3}\r", end="")
+        n = 1
+        gen = ItemGenerator(rs)
         with Pool(cpu_count()) as pool:
             for result in pool.imap(_run_mfkey32v2, gen):
+                # TODO: if some keys already recovered, test them on item before running mfkey32 on item
                 if result is not None:
-                    gen.test_key(*result)
-                print(f"{msg1}{gen.progress}{msg2}{len(gen.keys)}{msg3}\r", end="")
-        print(f"{msg1}{gen.progress}{msg2}{len(gen.keys)}{msg3}")
+                    gen.key_found(*result)
+                print(f"{msg1}{n}{msg2}{len(gen.keys)}{msg3}\r", end="")
+                n += 1
+        print()
         return gen.keys
 
     def on_exec(self, args: argparse.Namespace):
@@ -1942,16 +2365,22 @@ class HFMFELog(DeviceRequiredUnit):
         for uid in result_maps.keys():
             print(f" - Detection log for uid [{uid.upper()}]")
             result_maps_for_uid = result_maps[uid]
-            uid_found_keys = set()
             for block in result_maps_for_uid:
-                for keyType in 'AB':
-                    records = result_maps_for_uid[block][keyType] if keyType in result_maps_for_uid[block] else []
-                    if len(records) < 1:
-                        continue
-                    print(f"  > Decrypting block {block} key {keyType} detect log...")
-                    result_maps[uid][block][keyType] = self.decrypt_by_list(records, uid_found_keys)
-                    uid_found_keys.update(result_maps[uid][block][keyType])
-
+                print(f"  > Block {block} detect log decrypting...")
+                if 'A' in result_maps_for_uid[block]:
+                    # print(f" - A record: { result_maps[block]['A'] }")
+                    records = result_maps_for_uid[block]['A']
+                    if len(records) > 1:
+                        result_maps[uid][block]['A'] = self.decrypt_by_list(records)
+                    else:
+                        print(f"  > {len(records)} record")
+                if 'B' in result_maps_for_uid[block]:
+                    # print(f" - B record: { result_maps[block]['B'] }")
+                    records = result_maps_for_uid[block]['B']
+                    if len(records) > 1:
+                        result_maps[uid][block]['B'] = self.decrypt_by_list(records)
+                    else:
+                        print(f"  > {len(records)} record")
             print("  > Result ---------------------------")
             for block in result_maps_for_uid.keys():
                 if 'A' in result_maps_for_uid[block]:
@@ -2882,12 +3311,6 @@ class HFMFUEConfig(SlotIndexArgsAndGoUnit, HF14AAntiCollArgsUnit, DeviceRequired
                             help="Set data to be returned by the READ_SIG command.")
         parser.add_argument('--reset-auth-cnt', action='store_true',
                             help="Resets the counter of unsuccessful authentication attempts.")
-
-        detection_group = parser.add_mutually_exclusive_group()
-        detection_group.add_argument('--enable-log', action='store_true',
-                                   help="Enable password authentication logging")
-        detection_group.add_argument('--disable-log', action='store_true',
-                                   help="Disable password authentication logging")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -2983,30 +3406,6 @@ class HFMFUEConfig(SlotIndexArgsAndGoUnit, HF14AAntiCollArgsUnit, DeviceRequired
             except:
                 print(f"{CR}Failed to set write mode. Check if device firmware supports this feature.{C0}")
 
-        detection = self.cmd.mf0_ntag_get_detection_enable()
-        if args.enable_log:
-            change_requested = True
-            if detection is not None:
-                if not detection:
-                    detection = True
-                    self.cmd.mf0_ntag_set_detection_enable(detection)
-                    change_done = True
-                else:
-                    print(f'{CY}Requested logging of MFU authentication data already enabled{C0}')
-            else:
-                print(f'{CR}Detection functionality not available in this firmware{C0}')
-        elif args.disable_log:
-            change_requested = True
-            if detection is not None:
-                if detection:
-                    detection = False
-                    self.cmd.mf0_ntag_set_detection_enable(detection)
-                    change_done = True
-                else:
-                    print(f'{CY}Requested logging of MFU authentication data already disabled{C0}')
-            else:
-                print(f'{CR}Detection functionality not available in this firmware{C0}')
-
         if change_done or aux_data_changed:
             print(' - MFU/NTAG Emulator settings updated')
         if not (change_requested or aux_data_change_requested):
@@ -3044,55 +3443,6 @@ class HFMFUEConfig(SlotIndexArgsAndGoUnit, HF14AAntiCollArgsUnit, DeviceRequired
                 print(f'- {"Signature:":40}{CY}{signature.hex().upper()}{C0}')
             except:
                 pass
-
-            try:
-                detection = self.cmd.mf0_ntag_get_detection_enable()
-                print(
-                    f'- {"Log (password) mode:":40}{f"{CG}enabled{C0}" if detection else f"{CR}disabled{C0}"}')
-            except:
-                pass
-
-@hf_mfu.command('edetect')
-class HFMFUEDetect(SlotIndexArgsAndGoUnit, DeviceRequiredUnit):
-    def args_parser(self) -> ArgumentParserNoExit:
-        parser = ArgumentParserNoExit()
-        parser.description = 'Get Mifare Ultralight / NTAG emulator detection logs'
-        self.add_slot_args(parser)
-        parser.add_argument('--count', type=int, help="Number of log entries to retrieve", metavar="COUNT")
-        parser.add_argument('--index', type=int, default=0, help="Starting index (default: 0)", metavar="INDEX")
-        return parser
-
-    def on_exec(self, args: argparse.Namespace):
-        detection_enabled = self.cmd.mf0_ntag_get_detection_enable()
-        if not detection_enabled:
-            print(f"{CY}Detection logging is disabled for this slot{C0}")
-            return
-
-        total_count = self.cmd.mf0_ntag_get_detection_count()
-        print(f"Total detection log entries: {total_count}")
-
-        if total_count == 0:
-            print(f"{CY}No detection logs available{C0}")
-            return
-
-        if args.count is not None:
-            entries_to_get = min(args.count, total_count - args.index)
-        else:
-            entries_to_get = total_count - args.index
-
-        if entries_to_get <= 0:
-            print(f"{CY}No entries available from index {args.index}{C0}")
-            return
-
-        logs = self.cmd.mf0_ntag_get_detection_log(args.index)
-
-        print(f"\nPassword detection logs (showing {len(logs)} entries from index {args.index}):")
-        print("-" * 50)
-
-        for i, log_entry in enumerate(logs):
-            actual_index = args.index + i
-            password = log_entry['password']
-            print(f"{actual_index:3d}: {CY}{password.upper()}{C0}")
 
 
 @lf_em_410x.command('read')
@@ -3187,9 +3537,9 @@ class LFHIDProxEconfig(SlotIndexArgsAndGoUnit, LFHIDIdArgsUnit):
                 args.il = 0
             if args.oem is None:
                 args.oem = 0
-            format = HIDFormat.H10301
-            if args.format is not None:
-                format = HIDFormat[args.format]
+            if args.format is None:
+                format = HIDFormat.H10301
+            format = HIDFormat[args.format]
             id = struct.pack(">BIBIBH", format.value, args.fc, (args.cn >> 32), args.cn & 0xffffffff, args.il, args.oem)
             self.cmd.hidprox_set_emu_id(id)
             print(' - Set hidprox tag id success.')
